@@ -25,6 +25,6 @@ node down.js
 
 ### 备注
 - 下载脚本会自动下载V3版本最新数据，如果需要下载V2版本数据，请修改down.js中的`baseUrl`和`infoUrl`
-- 默认下载目录为当前目录，如果需要下载到其他目录，请修改down.js中的`outputDir`, 例如：`const outputDir = './data';`
-- 默认下载的json文件昵称是以adcode命名，也就是各地区的行政区划代码，如果需要下载以省市名称命名的json文件，请修改down.js中的`nameFormat`为`chinese`
+- 默认下载目录为当前目录，如果需要下载到其他目录，请修改down.js中的`outputDir`, 例如：`const outputDir = './data';`(已改为命令行交互的方式选择目录)
+- 默认下载的json文件昵称是以adcode命名，也就是各地区的行政区划代码，如果需要下载以省市名称命名的json文件，请修改down.js中的`nameFormat`为`chinese`(已改为命令行交互的方式选择命名方式)
 ![image](./download.png)
