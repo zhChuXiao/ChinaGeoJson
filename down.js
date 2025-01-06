@@ -82,24 +82,44 @@ const createDir = (dir) => {
     }
 };
 
-// HTTPS 请求 
-const httpsGet = (url) => {
-    return new Promise((resolve, reject) => {
-        https.get(url, (res) => {
-            let data = '';
-            res.on('data', (chunk) => data += chunk);
-            res.on('end', () => {
-                try {
-                    const jsonData = JSON.parse(data);
-                    resolve(jsonData);
-                } catch (error) {
-                    reject(new Error(`JSON 解析失败: ${error.message}`));
-                }
+// 修改 HTTPS 请求函数，添加重试机制
+const httpsGet = async (url, retries = 3) => {
+    for (let i = 0; i < retries; i++) {
+        try {
+            const response = await new Promise((resolve, reject) => {
+                https.get(url, (res) => {
+                    if (res.statusCode !== 200) {
+                        reject(new Error(`HTTP 状态码: ${res.statusCode}`));
+                        return;
+                    }
+
+                    let data = '';
+                    res.on('data', (chunk) => data += chunk);
+                    res.on('end', () => resolve(data));
+                }).on('error', reject);
             });
-        }).on('error', (error) => {
-            reject(new Error(`请求失败: ${error.message}`));
-        });
-    });
+
+            try {
+                return JSON.parse(response);
+            } catch (parseError) {
+                // 如果是最后一次重试，则抛出错误
+                if (i === retries - 1) {
+                    throw new Error(`JSON 解析失败: ${parseError.message}`);
+                }
+                // 否则继续重试
+                await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // 递增延迟
+                continue;
+            }
+        } catch (error) {
+            // 如果是最后一次重试，则抛出错误
+            if (i === retries - 1) {
+                throw error;
+            }
+            // 否则继续重试
+            await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // 递增延迟
+            continue;
+        }
+    }
 };
 
 // 修改 getFileName 函数，添加对全国地图的特殊处理
@@ -118,9 +138,27 @@ const getFileName = (code, info, type = '', nameFormat) => {
     }
 };
 
-// downloadJson 函数
-const downloadJson = async (url, outputPath, info, progressBar = null, currentItem = '') => {
+// 修改 downloadJson 函数，添加 useFullVersion 参数
+const downloadJson = async (url, outputPath, info, progressBar = null, currentItem = '', useFullVersion = false) => {
     try {
+        // 如果需要下载 full 版本，先尝试下载
+        if (useFullVersion) {
+            try {
+                const fullUrl = url.replace('.json', '_full.json');
+                const data = await httpsGet(fullUrl);
+                fs.writeFileSync(outputPath, JSON.stringify(data));
+                if (progressBar) {
+                    progressBar.update(progressBar.current + 1, currentItem);
+                } else {
+                    console.log(`${colors.green}✓${colors.reset} 成功下载: ${colors.cyan}${outputPath}${colors.reset}`);
+                }
+                return;
+            } catch (error) {
+                console.log(`${colors.yellow}!${colors.reset} full 版本下载失败，尝试基础版本...`);
+            }
+        }
+
+        // 下载基础版本
         const data = await httpsGet(url);
         fs.writeFileSync(outputPath, JSON.stringify(data));
         if (progressBar) {
@@ -131,6 +169,9 @@ const downloadJson = async (url, outputPath, info, progressBar = null, currentIt
         await new Promise(resolve => setTimeout(resolve, 200));
     } catch (error) {
         console.error(`${colors.red}✗${colors.reset} 下载失败: ${colors.cyan}${url}${colors.reset}`, error.message);
+        if (progressBar) {
+            progressBar.update(progressBar.current + 1, `${colors.red}${currentItem} (失败)${colors.reset}`);
+        }
     }
 };
 
@@ -229,16 +270,11 @@ const main = async () => {
                 );
 
                 // 计算该省的总任务数
-                let provinceTotalTasks = 1; // 基础省级地图
-                if (provinceLevel === 1) provinceTotalTasks++; // 市级边界版本
-                if (provinceLevel === 2) provinceTotalTasks++; // 区县级边界版本
+                let provinceTotalTasks = 1; // 省级地图
 
                 // 添加市级地图任务数
                 if (provinceLevel !== 3) {
-                    cities.forEach(() => {
-                        provinceTotalTasks++; // 基础市级地图
-                        if (cityLevel === 1) provinceTotalTasks++; // 区县级边界版本
-                    });
+                    provinceTotalTasks += cities.length;
                 }
 
                 // 添加区县级地图任务数（如果需要）
@@ -251,65 +287,28 @@ const main = async () => {
 
                 const progressBar = new ProgressBar(info.name, provinceTotalTasks);
 
-                // 下载省级基础地图
+                // 下载省级地图（根据选择的粒度决定是否使用 full 版本）
                 await downloadJson(
                     `${baseUrl}${provinceCode}.json`,
                     path.join(finalOutputDir, 'province', getFileName(provinceCode, info, '', nameFormat)),
                     info,
                     progressBar,
-                    '省级基础地图'
+                    '省级地图',
+                    provinceLevel !== 3  // 如果不是跳过下级边界，则尝试下载 full 版本
                 );
-
-                // 下载省级市边界版本
-                if (provinceLevel === 1) {
-                    await downloadJson(
-                        `${baseUrl}${provinceCode}_full.json`,
-                        path.join(finalOutputDir, 'province', getFileName(provinceCode, info, '_full', nameFormat)),
-                        info,
-                        progressBar,
-                        '省级（含市边界）'
-                    );
-                }
-
-                // 下载省级区县边界版本
-                if (provinceLevel === 2) {
-                    // 判断是否为直辖市
-                    const isMunicipality = MUNICIPALITIES.includes(provinceCode);
-                    const suffix = isMunicipality ? '_full' : '_full_district';
-                    const description = isMunicipality ? '省级（含区县边界）' : '省级（含区县边界）';
-                    
-                    await downloadJson(
-                        `${baseUrl}${provinceCode}${suffix}.json`,
-                        path.join(finalOutputDir, 'province', getFileName(provinceCode, info, suffix, nameFormat)),
-                        info,
-                        progressBar,
-                        description
-                    );
-                }
 
                 // 如果不是跳过下级边界
                 if (provinceLevel !== 3) {
                     // 下载市级地图
                     for (const [cityCode, cityInfo] of cities) {
-                        // 下载市级基础地图
                         await downloadJson(
                             `${baseUrl}${cityCode}.json`,
                             path.join(finalOutputDir, 'citys', getFileName(cityCode, cityInfo, '', nameFormat)),
                             cityInfo,
                             progressBar,
-                            `市级: ${cityInfo.name}`
+                            `市级: ${cityInfo.name}`,
+                            cityLevel === 1  // 如果选择包含区县级边界，则尝试下载 full 版本
                         );
-
-                        // 下载市级区县边界版本
-                        if (cityLevel === 1) {
-                            await downloadJson(
-                                `${baseUrl}${cityCode}_full.json`,
-                                path.join(finalOutputDir, 'citys', getFileName(cityCode, cityInfo, '_full', nameFormat)),
-                                cityInfo,
-                                progressBar,
-                                `市级（含区县边界）: ${cityInfo.name}`
-                            );
-                        }
                     }
 
                     // 下载区县级地图（如果需要）
