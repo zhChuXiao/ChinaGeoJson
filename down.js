@@ -8,6 +8,9 @@ const readline = require('readline');
 const baseUrl = 'https://geo.datav.aliyun.com/areas_v3/bound/';
 // 这是所有地区编码
 const infoUrl = 'https://geo.datav.aliyun.com/areas_v3/bound/infos.json';
+// 控制直辖市下级区是否放在 citys 文件夹下（便于地图下钻的逻辑处理）
+const MUNICIPALITIES = ['110000', '120000', '310000', '500000']; // 北京、天津、上海、重庆
+let municipalityChildrenInCitys; // 控制直辖市下级区是否放在 citys 文件夹下
 // // 这是输出目录
 // const outputDir = './';
 
@@ -115,7 +118,7 @@ const getFileName = (code, info, type = '', nameFormat) => {
     }
 };
 
-// 修改 downloadJson 函数
+// downloadJson 函数
 const downloadJson = async (url, outputPath, info, progressBar = null, currentItem = '') => {
     try {
         const data = await httpsGet(url);
@@ -143,6 +146,18 @@ const main = async () => {
         // 获取用户选择的命名方式
         const nameFormatAnswer = await question(`${colors.yellow}请选择文件命名方式 (1: 行政代码, 2: 中文名称) [默认: 1]：${colors.reset}`);
         const nameFormat = nameFormatAnswer === '2' ? 'chinese' : 'adcode';
+
+        // 获取省级地图数据粒度
+        const provinceLevelAnswer = await question(`${colors.yellow}请选择省级地图数据粒度 (1: 包含市级边界, 2: 包含区县级边界, 3: 不包含下级边界) [默认: 1]：${colors.reset}`);
+        const provinceLevel = provinceLevelAnswer === '2' ? 2 : (provinceLevelAnswer === '3' ? 3 : 1);
+
+        // 获取市级地图数据粒度
+        const cityLevelAnswer = await question(`${colors.yellow}请选择市级地图数据粒度 (1: 包含区县级边界, 2: 不包含下级边界) [默认: 1]：${colors.reset}`);
+        const cityLevel = cityLevelAnswer === '2' ? 2 : 1;
+
+        // 添加直辖市下级区存放位置的选择
+        const municipalityAnswer = await question(`${colors.yellow}是否将直辖市下级区地图放在citys文件夹下（便于地图下钻的逻辑处理）(y/n) [默认: y]：${colors.reset}`);
+        municipalityChildrenInCitys = municipalityAnswer.toLowerCase() !== 'n';
 
         // 创建输出目录
         createDir(finalOutputDir);
@@ -201,59 +216,117 @@ const main = async () => {
             if (adcode.endsWith('0000') && adcode !== '100000') {
                 const provinceCode = adcode;
                 
-                // 修改这部分代码来正确处理直辖市的区县
-                const subAreas = Object.entries(areaInfos).filter(([code]) => 
+                // 获取所有下级行政区
+                const cities = Object.entries(areaInfos).filter(([code]) => 
                     code.startsWith(provinceCode.slice(0, 2)) && 
+                    code.endsWith('00') && 
                     code !== provinceCode
                 );
 
-                // 计算该省/直辖市的总任务数
-                let provinceTotalTasks = 1; // 省级地图
-                provinceTotalTasks += subAreas.length; // 所有下级行政区
+                const counties = Object.entries(areaInfos).filter(([code]) => 
+                    code.startsWith(provinceCode.slice(0, 2)) && 
+                    !code.endsWith('00')
+                );
+
+                // 计算该省的总任务数
+                let provinceTotalTasks = 1; // 基础省级地图
+                if (provinceLevel === 1) provinceTotalTasks++; // 市级边界版本
+                if (provinceLevel === 2) provinceTotalTasks++; // 区县级边界版本
+
+                // 添加市级地图任务数
+                if (provinceLevel !== 3) {
+                    cities.forEach(() => {
+                        provinceTotalTasks++; // 基础市级地图
+                        if (cityLevel === 1) provinceTotalTasks++; // 区县级边界版本
+                    });
+                }
+
+                // 添加区县级地图任务数（如果需要）
+                if (provinceLevel === 2 || (provinceLevel !== 3 && cityLevel === 1)) {
+                    provinceTotalTasks += counties.length;
+                }
 
                 console.log(`${colors.blue}→${colors.reset} 开始处理: ${colors.bright}${info.name}${colors.reset}`);
                 console.log(`${colors.blue}ℹ${colors.reset} 需要下载 ${colors.yellow}${provinceTotalTasks}${colors.reset} 个地图文件`);
 
-                // 创建省份进度条
                 const progressBar = new ProgressBar(info.name, provinceTotalTasks);
 
-                // 下载省级地图
+                // 下载省级基础地图
                 await downloadJson(
                     `${baseUrl}${provinceCode}.json`,
                     path.join(finalOutputDir, 'province', getFileName(provinceCode, info, '', nameFormat)),
                     info,
                     progressBar,
-                    '省级地图'
+                    '省级基础地图'
                 );
 
-                // 下载所有下级行政区地图
-                for (const [areaCode, areaInfo] of subAreas) {
-                    const isCity = areaCode.endsWith('00');
-                    const targetDir = isCity ? 'citys' : 'county';
+                // 下载省级市边界版本
+                if (provinceLevel === 1) {
+                    await downloadJson(
+                        `${baseUrl}${provinceCode}_full.json`,
+                        path.join(finalOutputDir, 'province', getFileName(provinceCode, info, '_full', nameFormat)),
+                        info,
+                        progressBar,
+                        '省级（含市边界）'
+                    );
+                }
+
+                // 下载省级区县边界版本
+                if (provinceLevel === 2) {
+                    // 判断是否为直辖市
+                    const isMunicipality = MUNICIPALITIES.includes(provinceCode);
+                    const suffix = isMunicipality ? '_full' : '_full_district';
+                    const description = isMunicipality ? '省级（含区县边界）' : '省级（含区县边界）';
                     
                     await downloadJson(
-                        `${baseUrl}${areaCode}.json`,
-                        path.join(finalOutputDir, targetDir, getFileName(areaCode, areaInfo, '', nameFormat)),
-                        areaInfo,
+                        `${baseUrl}${provinceCode}${suffix}.json`,
+                        path.join(finalOutputDir, 'province', getFileName(provinceCode, info, suffix, nameFormat)),
+                        info,
                         progressBar,
-                        `${isCity ? '市级' : '县区'}: ${areaInfo.name}`
+                        description
                     );
+                }
 
-                    // 获取该市的所有县/区
-                    const counties = Object.entries(areaInfos).filter(([code]) => 
-                        code.startsWith(cityCode.slice(0, 4)) && 
-                        !code.endsWith('00')
-                    );
-
-                    // 下载县级地图
-                    for (const [countyCode, countyInfo] of counties) {
+                // 如果不是跳过下级边界
+                if (provinceLevel !== 3) {
+                    // 下载市级地图
+                    for (const [cityCode, cityInfo] of cities) {
+                        // 下载市级基础地图
                         await downloadJson(
-                            `${baseUrl}${countyCode}.json`,
-                            path.join(finalOutputDir, 'county', getFileName(countyCode, countyInfo, '', nameFormat)),
-                            countyInfo,
+                            `${baseUrl}${cityCode}.json`,
+                            path.join(finalOutputDir, 'citys', getFileName(cityCode, cityInfo, '', nameFormat)),
+                            cityInfo,
                             progressBar,
-                            `县区: ${countyInfo.name}`
+                            `市级: ${cityInfo.name}`
                         );
+
+                        // 下载市级区县边界版本
+                        if (cityLevel === 1) {
+                            await downloadJson(
+                                `${baseUrl}${cityCode}_full.json`,
+                                path.join(finalOutputDir, 'citys', getFileName(cityCode, cityInfo, '_full', nameFormat)),
+                                cityInfo,
+                                progressBar,
+                                `市级（含区县边界）: ${cityInfo.name}`
+                            );
+                        }
+                    }
+
+                    // 下载区县级地图（如果需要）
+                    if (provinceLevel === 2 || cityLevel === 1) {
+                        for (const [countyCode, countyInfo] of counties) {
+                            // 确定目标目录
+                            const isMunicipality = MUNICIPALITIES.includes(provinceCode);
+                            const targetDir = (isMunicipality && municipalityChildrenInCitys) ? 'citys' : 'county';
+                            
+                            await downloadJson(
+                                `${baseUrl}${countyCode}.json`,
+                                path.join(finalOutputDir, targetDir, getFileName(countyCode, countyInfo, '', nameFormat)),
+                                countyInfo,
+                                progressBar,
+                                `区县: ${countyInfo.name}`
+                            );
+                        }
                     }
                 }
 
