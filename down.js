@@ -202,7 +202,6 @@ const main = async () => {
                 const provinceCode = adcode;
                 
                 // 修改这部分代码来正确处理直辖市的区县
-                // 获取所有下级行政区（包括市辖区和县）
                 const subAreas = Object.entries(areaInfos).filter(([code]) => 
                     code.startsWith(provinceCode.slice(0, 2)) && 
                     code !== provinceCode
@@ -239,6 +238,23 @@ const main = async () => {
                         progressBar,
                         `${isCity ? '市级' : '县区'}: ${areaInfo.name}`
                     );
+
+                    // 获取该市的所有县/区
+                    const counties = Object.entries(areaInfos).filter(([code]) => 
+                        code.startsWith(cityCode.slice(0, 4)) && 
+                        !code.endsWith('00')
+                    );
+
+                    // 下载县级地图
+                    for (const [countyCode, countyInfo] of counties) {
+                        await downloadJson(
+                            `${baseUrl}${countyCode}.json`,
+                            path.join(finalOutputDir, 'county', getFileName(countyCode, countyInfo, '', nameFormat)),
+                            countyInfo,
+                            progressBar,
+                            `县区: ${countyInfo.name}`
+                        );
+                    }
                 }
 
                 progressBar.complete();
