@@ -1,19 +1,28 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const readline = require('readline');
 
 // 基础配置
 // 这是地图的下载地址
 const baseUrl = 'https://geo.datav.aliyun.com/areas_v3/bound/';
 // 这是所有地区编码
 const infoUrl = 'https://geo.datav.aliyun.com/areas_v3/bound/infos.json';
-// 这是输出目录
-const outputDir = './';
+// // 这是输出目录
+// const outputDir = './';
 
-// 添加命名方式配置
-const config = {
-    nameFormat: 'adcode', // 可选值: 'adcode', 'chinese'
-};
+// // 添加命名方式配置
+// const config = {
+//     nameFormat: 'adcode', // 可选值: 'adcode', 'chinese'
+// };
+
+// 命令行交互
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+});
+
+const question = (query) => new Promise((resolve) => rl.question(query, resolve));
 
 // ANSI 颜色代码 终端进度条用
 const colors = {
@@ -91,13 +100,13 @@ const httpsGet = (url) => {
 };
 
 // 修改 getFileName 函数，添加对全国地图的特殊处理
-const getFileName = (code, info, type = '') => {
+const getFileName = (code, info, type = '', nameFormat) => {
     // 如果是全国地图（代码为100000），则返回 china.json
     if (code === '100000') {
         return 'china.json';
     }
     
-    switch (config.nameFormat) {
+    switch (nameFormat) {
         case 'chinese':
             return `${info.name}${type}.json`;
         case 'adcode':
@@ -122,145 +131,127 @@ const downloadJson = async (url, outputPath, info, progressBar = null, currentIt
     }
 };
 
-// 获取地区信息
-const getAreaInfos = async () => {
-    try {
-        console.log(`${colors.blue}ℹ${colors.reset} 正在获取地区信息...`);
-        const data = await httpsGet(infoUrl);
-        
-        // 保存压缩版的 info.json
-        fs.writeFileSync(path.join(outputDir, 'info.json'), JSON.stringify(data));
-        console.log(`${colors.green}✓${colors.reset} 地区信息已保存至 info.json`);
-        
-        return data;
-    } catch (error) {
-        console.error(`${colors.red}✗${colors.reset} 获取地区信息失败:`, error.message);
-        return null;
-    }
-};
-
 // 主函数
 const main = async () => {
-    console.log('\n' + colors.bright + colors.bgBlue + ' 中国地图数据下载工具 ' + colors.reset + '\n');
+    try {
+        console.log('\n' + colors.bright + colors.bgBlue + ' 中国地图数据下载工具 ' + colors.reset + '\n');
 
-    // 创建输出目录
-    createDir(path.join(outputDir, 'province'));
-    createDir(path.join(outputDir, 'citys'));
-    createDir(path.join(outputDir, 'county'));
+        // 获取用户输入的输出目录
+        const outputDir = await question(`${colors.yellow}请输入输出目录路径 (直接回车默认为当前目录)：${colors.reset}`);
+        const finalOutputDir = outputDir || './';
 
-    // 获取地区信息
-    const areaInfos = await getAreaInfos();
-    if (!areaInfos) return;
+        // 获取用户选择的命名方式
+        const nameFormatAnswer = await question(`${colors.yellow}请选择文件命名方式 (1: 行政代码, 2: 中文名称) [默认: 1]：${colors.reset}`);
+        const nameFormat = nameFormatAnswer === '2' ? 'chinese' : 'adcode';
 
-    // 计算总任务数
-    let totalFiles = 1; // 全国地图
-    let provinceCount = 0;
-    for (const [adcode, info] of Object.entries(areaInfos)) {
-        if (adcode.endsWith('0000') && adcode !== '100000') {
-            provinceCount++;
-            const provinceCode = adcode;
-            const cities = Object.entries(areaInfos).filter(([code]) => 
-                code.startsWith(provinceCode.slice(0, 2)) && 
-                code.endsWith('00') && 
-                code !== provinceCode
-            );
-            totalFiles++; // 省级地图
-            totalFiles += cities.length; // 市级地图
+        // 创建输出目录
+        createDir(finalOutputDir);
+        createDir(path.join(finalOutputDir, 'province'));
+        createDir(path.join(finalOutputDir, 'citys'));
+        createDir(path.join(finalOutputDir, 'county'));
 
-            for (const [cityCode] of cities) {
-                const counties = Object.entries(areaInfos).filter(([code]) => 
-                    code.startsWith(cityCode.slice(0, 4)) && 
-                    !code.endsWith('00')
+        // 获取地区信息
+        console.log(`${colors.blue}ℹ${colors.reset} 正在获取地区信息...`);
+        const areaInfos = await httpsGet(infoUrl);
+        if (!areaInfos) return;
+
+        // 保存压缩版的 info.json
+        fs.writeFileSync(path.join(finalOutputDir, 'info.json'), JSON.stringify(areaInfos));
+        console.log(`${colors.green}✓${colors.reset} 地区信息已保存至 info.json`);
+
+        // 计算总任务数
+        let totalFiles = 1; // 全国地图
+        let provinceCount = 0;
+        for (const [adcode, info] of Object.entries(areaInfos)) {
+            if (adcode.endsWith('0000') && adcode !== '100000') {
+                provinceCount++;
+                const provinceCode = adcode;
+                const cities = Object.entries(areaInfos).filter(([code]) => 
+                    code.startsWith(provinceCode.slice(0, 2)) && 
+                    code.endsWith('00') && 
+                    code !== provinceCode
                 );
-                totalFiles += counties.length; // 县级地图
-            }
-        }
-    }
+                totalFiles++; // 省级地图
+                totalFiles += cities.length; // 市级地图
 
-    console.log(`${colors.blue}ℹ${colors.reset} 总计需要下载 ${colors.yellow}${totalFiles}${colors.reset} 个地图文件`);
-    console.log(`${colors.blue}ℹ${colors.reset} 共有 ${colors.yellow}${provinceCount}${colors.reset} 个省级行政区\n`);
-
-    // 下载全国地图
-    const chinaInfo = areaInfos['100000'];
-    await downloadJson(
-        `${baseUrl}100000.json`,
-        path.join(outputDir, getFileName('100000', chinaInfo)),
-        chinaInfo
-    );
-    console.log(`${colors.blue}→${colors.reset} 全国地图下载完成\n`);
-
-    // 处理省级数据
-    for (const [adcode, info] of Object.entries(areaInfos)) {
-        if (adcode.endsWith('0000') && adcode !== '100000') {
-            const provinceCode = adcode;
-            
-            // 计算该省的总任务数
-            const cities = Object.entries(areaInfos).filter(([code]) => 
-                code.startsWith(provinceCode.slice(0, 2)) && 
-                code.endsWith('00') && 
-                code !== provinceCode
-            );
-
-            let provinceTotalTasks = 1;
-            provinceTotalTasks += cities.length;
-
-            for (const [cityCode] of cities) {
-                const counties = Object.entries(areaInfos).filter(([code]) => 
-                    code.startsWith(cityCode.slice(0, 4)) && 
-                    !code.endsWith('00')
-                );
-                provinceTotalTasks += counties.length;
-            }
-
-            console.log(`${colors.blue}→${colors.reset} 开始处理: ${colors.bright}${info.name}${colors.reset}`);
-            console.log(`${colors.blue}ℹ${colors.reset} 需要下载 ${colors.yellow}${provinceTotalTasks}${colors.reset} 个地图文件`);
-
-            // 创建省份进度条
-            const progressBar = new ProgressBar(info.name, provinceTotalTasks);
-
-            // 下载省级地图
-            await downloadJson(
-                `${baseUrl}${provinceCode}.json`,
-                path.join(outputDir, 'province', getFileName(provinceCode, info)),
-                info,
-                progressBar,
-                '省级地图'
-            );
-
-            // 下载市级地图
-            for (const [cityCode, cityInfo] of cities) {
-                await downloadJson(
-                    `${baseUrl}${cityCode}.json`,
-                    path.join(outputDir, 'citys', getFileName(cityCode, cityInfo)),
-                    cityInfo,
-                    progressBar,
-                    `市级: ${cityInfo.name}`
-                );
-
-                // 获取该市的所有县/区
-                const counties = Object.entries(areaInfos).filter(([code, countyInfo]) => 
-                    code.startsWith(cityCode.slice(0, 4)) && 
-                    !code.endsWith('00')
-                );
-
-                // 下载县级地图
-                for (const [countyCode, countyInfo] of counties) {
-                    await downloadJson(
-                        `${baseUrl}${countyCode}.json`,
-                        path.join(outputDir, 'county', getFileName(countyCode, countyInfo)),
-                        countyInfo,
-                        progressBar,
-                        `县区: ${countyInfo.name}`
+                for (const [cityCode] of cities) {
+                    const counties = Object.entries(areaInfos).filter(([code]) => 
+                        code.startsWith(cityCode.slice(0, 4)) && 
+                        !code.endsWith('00')
                     );
+                    totalFiles += counties.length; // 县级地图
                 }
             }
-
-            progressBar.complete();
-            console.log(`${colors.green}✓${colors.reset} ${colors.bright}${info.name}${colors.reset} 处理完成！\n`);
         }
-    }
 
-    console.log(`${colors.green}✨${colors.reset} ${colors.bright}所有地图数据下载完成！${colors.reset}\n`);
+        console.log(`${colors.blue}ℹ${colors.reset} 总计需要下载 ${colors.yellow}${totalFiles}${colors.reset} 个地图文件`);
+        console.log(`${colors.blue}ℹ${colors.reset} 共有 ${colors.yellow}${provinceCount}${colors.reset} 个省级行政区\n`);
+
+        // 下载全国地图
+        const chinaInfo = areaInfos['100000'];
+        await downloadJson(
+            `${baseUrl}100000.json`,
+            path.join(finalOutputDir, getFileName('100000', chinaInfo, '', nameFormat)),
+            chinaInfo
+        );
+        console.log(`${colors.blue}→${colors.reset} 全国地图下载完成\n`);
+
+        // 处理省级数据
+        for (const [adcode, info] of Object.entries(areaInfos)) {
+            if (adcode.endsWith('0000') && adcode !== '100000') {
+                const provinceCode = adcode;
+                
+                // 修改这部分代码来正确处理直辖市的区县
+                // 获取所有下级行政区（包括市辖区和县）
+                const subAreas = Object.entries(areaInfos).filter(([code]) => 
+                    code.startsWith(provinceCode.slice(0, 2)) && 
+                    code !== provinceCode
+                );
+
+                // 计算该省/直辖市的总任务数
+                let provinceTotalTasks = 1; // 省级地图
+                provinceTotalTasks += subAreas.length; // 所有下级行政区
+
+                console.log(`${colors.blue}→${colors.reset} 开始处理: ${colors.bright}${info.name}${colors.reset}`);
+                console.log(`${colors.blue}ℹ${colors.reset} 需要下载 ${colors.yellow}${provinceTotalTasks}${colors.reset} 个地图文件`);
+
+                // 创建省份进度条
+                const progressBar = new ProgressBar(info.name, provinceTotalTasks);
+
+                // 下载省级地图
+                await downloadJson(
+                    `${baseUrl}${provinceCode}.json`,
+                    path.join(finalOutputDir, 'province', getFileName(provinceCode, info, '', nameFormat)),
+                    info,
+                    progressBar,
+                    '省级地图'
+                );
+
+                // 下载所有下级行政区地图
+                for (const [areaCode, areaInfo] of subAreas) {
+                    const isCity = areaCode.endsWith('00');
+                    const targetDir = isCity ? 'citys' : 'county';
+                    
+                    await downloadJson(
+                        `${baseUrl}${areaCode}.json`,
+                        path.join(finalOutputDir, targetDir, getFileName(areaCode, areaInfo, '', nameFormat)),
+                        areaInfo,
+                        progressBar,
+                        `${isCity ? '市级' : '县区'}: ${areaInfo.name}`
+                    );
+                }
+
+                progressBar.complete();
+                console.log(`${colors.green}✓${colors.reset} ${colors.bright}${info.name}${colors.reset} 处理完成！\n`);
+            }
+        }
+
+        console.log(`${colors.green}✨${colors.reset} ${colors.bright}所有地图数据下载完成！${colors.reset}\n`);
+    } catch (error) {
+        console.error(`${colors.red}错误:${colors.reset}`, error.message);
+    } finally {
+        rl.close();
+    }
 };
 
 // 添加错误处理
