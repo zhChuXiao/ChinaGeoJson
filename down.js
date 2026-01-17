@@ -11,6 +11,26 @@ const infoUrl = 'https://geo.datav.aliyun.com/areas_v3/bound/infos.json';
 // 控制直辖市下级区是否放在 citys 文件夹下（便于地图下钻的逻辑处理）
 const MUNICIPALITIES = ['110000', '120000', '310000', '500000']; // 北京、天津、上海、重庆
 let municipalityChildrenInCitys; // 控制直辖市下级区是否放在 citys 文件夹下
+
+// 当前正在写入的文件路径（用于 SIGINT 清理）
+let currentWritingFile = null;
+
+// Ctrl+C 时清理不完整的文件
+process.on('SIGINT', () => {
+    console.log(`\n${colors.yellow}⚠${colors.reset} 检测到中断信号 (Ctrl+C)...`);
+    
+    if (currentWritingFile && fs.existsSync(currentWritingFile)) {
+        try {
+            fs.unlinkSync(currentWritingFile);
+            console.log(`${colors.yellow}⚠${colors.reset} 已清理不完整文件: ${colors.cyan}${currentWritingFile}${colors.reset}`);
+        } catch (err) {
+            console.error(`${colors.red}✗${colors.reset} 清理文件失败:`, err.message);
+        }
+    }
+    
+    console.log(`${colors.blue}ℹ${colors.reset} 程序已退出\n`);
+    process.exit(0);
+});
 // // 这是输出目录
 // const outputDir = './';
 
@@ -61,13 +81,20 @@ class ProgressBar {
         const empty = '░'.repeat(emptyWidth);
         const bar = `${filled}${empty}`;
 
-        process.stdout.clearLine(0);
-        process.stdout.cursorTo(0);
-        process.stdout.write(
-            `${colors.magenta}♦${colors.reset} ${colors.bright}${this.name}${colors.reset} ` +
-            `${colors.cyan}${bar}${colors.reset} ${colors.yellow}${percentage}%${colors.reset} ` +
-            `(${this.current}/${this.total}) ${colors.dim}${currentItem}${colors.reset}`
-        );
+        if (process.stdout.isTTY) {
+            process.stdout.clearLine(0);
+            process.stdout.cursorTo(0);
+            process.stdout.write(
+                `${colors.magenta}♦${colors.reset} ${colors.bright}${this.name}${colors.reset} ` +
+                `${colors.cyan}${bar}${colors.reset} ${colors.yellow}${percentage}%${colors.reset} ` +
+                `(${this.current}/${this.total}) ${colors.dim}${currentItem}${colors.reset}`
+            );
+        } else {
+            // 非 TTY 环境：简化输出，避免刷屏
+            if (this.current === this.total || this.current % 10 === 0) {
+                console.log(`[${this.name}] ${percentage}% (${this.current}/${this.total}) ${currentItem}`);
+            }
+        }
     }
 
     complete() {
@@ -89,6 +116,8 @@ const httpsGet = async (url, retries = 3) => {
             const response = await new Promise((resolve, reject) => {
                 https.get(url, (res) => {
                     if (res.statusCode !== 200) {
+                        // 消耗响应流释放资源，防止内存泄漏
+                        res.resume();
                         reject(new Error(`HTTP 状态码: ${res.statusCode}`));
                         return;
                     }
@@ -138,6 +167,13 @@ const getFileName = (code, info, type = '', nameFormat) => {
     }
 };
 
+// 追踪写入状态，便于中断时清理
+const safeWriteFile = (filePath, content) => {
+    currentWritingFile = filePath;
+    fs.writeFileSync(filePath, content);
+    currentWritingFile = null; // 写入完成清除追踪
+};
+
 // 修改 downloadJson 函数，添加 useFullVersion 参数
 const downloadJson = async (url, outputPath, info, progressBar = null, currentItem = '', useFullVersion = false) => {
     try {
@@ -146,7 +182,7 @@ const downloadJson = async (url, outputPath, info, progressBar = null, currentIt
             try {
                 const fullUrl = url.replace('.json', '_full.json');
                 const data = await httpsGet(fullUrl);
-                fs.writeFileSync(outputPath, JSON.stringify(data));
+                safeWriteFile(outputPath, JSON.stringify(data));
                 if (progressBar) {
                     progressBar.update(progressBar.current + 1, currentItem);
                 } else {
@@ -160,7 +196,7 @@ const downloadJson = async (url, outputPath, info, progressBar = null, currentIt
 
         // 下载基础版本
         const data = await httpsGet(url);
-        fs.writeFileSync(outputPath, JSON.stringify(data));
+        safeWriteFile(outputPath, JSON.stringify(data));
         if (progressBar) {
             progressBar.update(progressBar.current + 1, currentItem);
         } else {
@@ -184,6 +220,72 @@ const main = async () => {
         const outputDir = await question(`${colors.yellow}请输入输出目录路径 (直接回车默认为当前目录)：${colors.reset}`);
         const finalOutputDir = outputDir || './';
 
+        // 获取地区信息用于省份选择
+        console.log(`${colors.blue}ℹ${colors.reset} 正在获取地区信息...`);
+        const areaInfos = await httpsGet(infoUrl);
+        if (!areaInfos) {
+            console.error(`${colors.red}✗${colors.reset} 获取地区信息失败`);
+            return;
+        }
+        console.log(`${colors.green}✓${colors.reset} 地区信息获取成功\n`);
+
+        // 提取所有省级行政区
+        const provinces = Object.entries(areaInfos)
+            .filter(([code]) => code.endsWith('0000') && code !== '100000')
+            .map(([code, info]) => ({ code, name: info.name }));
+
+        // 选择下载范围：全部省份 or 指定省份
+        const downloadScopeAnswer = await question(`${colors.yellow}请选择下载范围 (1: 全部省份, 2: 选择指定省份) [默认: 1]：${colors.reset}`);
+        
+        let selectedProvinces = provinces; // 默认全部省份
+        
+        if (downloadScopeAnswer === '2') {
+            // 列出所有省份
+            console.log(`\n${colors.bright}可选省份列表：${colors.reset}`);
+            provinces.forEach((province, index) => {
+                const num = String(index + 1).padStart(2, ' ');
+                // 每行显示4个省份
+                const suffix = (index + 1) % 4 === 0 ? '\n' : '\t';
+                process.stdout.write(`${colors.cyan}${num}.${colors.reset} ${province.name}${suffix}`);
+            });
+            // 确保换行
+            if (provinces.length % 4 !== 0) console.log('');
+            console.log('');
+
+            const provinceIndexAnswer = await question(`${colors.yellow}请输入省份序号，多个用英文逗号分隔 (如: 1,5,11)：${colors.reset}`);
+            
+            // 解析输入的多个序号
+            const inputIndices = provinceIndexAnswer.split(',').map(s => s.trim());
+            const validProvinces = [];
+            const invalidIndices = [];
+            
+            for (const indexStr of inputIndices) {
+                const idx = parseInt(indexStr, 10) - 1;
+                if (idx >= 0 && idx < provinces.length && !isNaN(idx)) {
+                    // 避免重复添加
+                    if (!validProvinces.find(p => p.code === provinces[idx].code)) {
+                        validProvinces.push(provinces[idx]);
+                    }
+                } else {
+                    invalidIndices.push(indexStr);
+                }
+            }
+            
+            // 报告无效序号
+            if (invalidIndices.length > 0) {
+                console.log(`${colors.yellow}⚠${colors.reset} 忽略无效序号: ${invalidIndices.join(', ')}`);
+            }
+            
+            if (validProvinces.length === 0) {
+                console.error(`${colors.red}✗${colors.reset} 没有有效的省份序号，退出程序`);
+                return;
+            }
+            
+            selectedProvinces = validProvinces;
+            const selectedNames = selectedProvinces.map(p => p.name).join('、');
+            console.log(`${colors.green}✓${colors.reset} 已选择 ${colors.bright}${selectedProvinces.length}${colors.reset} 个省份: ${colors.bright}${selectedNames}${colors.reset}\n`);
+        }
+
         // 获取用户选择的命名方式
         const nameFormatAnswer = await question(`${colors.yellow}请选择文件命名方式 (1: 行政代码, 2: 中文名称) [默认: 1]：${colors.reset}`);
         const nameFormat = nameFormatAnswer === '2' ? 'chinese' : 'adcode';
@@ -206,42 +308,33 @@ const main = async () => {
         createDir(path.join(finalOutputDir, 'citys'));
         createDir(path.join(finalOutputDir, 'county'));
 
-        // 获取地区信息
-        console.log(`${colors.blue}ℹ${colors.reset} 正在获取地区信息...`);
-        const areaInfos = await httpsGet(infoUrl);
-        if (!areaInfos) return;
-
         // 保存压缩版的 info.json
         fs.writeFileSync(path.join(finalOutputDir, 'info.json'), JSON.stringify(areaInfos));
         console.log(`${colors.green}✓${colors.reset} 地区信息已保存至 info.json`);
 
-        // 计算总任务数
+        // 计算总任务数（基于选中的省份）
         let totalFiles = 1; // 全国地图
-        let provinceCount = 0;
-        for (const [adcode, info] of Object.entries(areaInfos)) {
-            if (adcode.endsWith('0000') && adcode !== '100000') {
-                provinceCount++;
-                const provinceCode = adcode;
-                const cities = Object.entries(areaInfos).filter(([code]) => 
-                    code.startsWith(provinceCode.slice(0, 2)) && 
-                    code.endsWith('00') && 
-                    code !== provinceCode
-                );
-                totalFiles++; // 省级地图
-                totalFiles += cities.length; // 市级地图
+        for (const province of selectedProvinces) {
+            const provinceCode = province.code;
+            const cities = Object.entries(areaInfos).filter(([code]) => 
+                code.startsWith(provinceCode.slice(0, 2)) && 
+                code.endsWith('00') && 
+                code !== provinceCode
+            );
+            totalFiles++; // 省级地图
+            totalFiles += cities.length; // 市级地图
 
-                for (const [cityCode] of cities) {
-                    const counties = Object.entries(areaInfos).filter(([code]) => 
-                        code.startsWith(cityCode.slice(0, 4)) && 
-                        !code.endsWith('00')
-                    );
-                    totalFiles += counties.length; // 县级地图
-                }
+            for (const [cityCode] of cities) {
+                const counties = Object.entries(areaInfos).filter(([code]) => 
+                    code.startsWith(cityCode.slice(0, 4)) && 
+                    !code.endsWith('00')
+                );
+                totalFiles += counties.length; // 县级地图
             }
         }
 
         console.log(`${colors.blue}ℹ${colors.reset} 总计需要下载 ${colors.yellow}${totalFiles}${colors.reset} 个地图文件`);
-        console.log(`${colors.blue}ℹ${colors.reset} 共有 ${colors.yellow}${provinceCount}${colors.reset} 个省级行政区\n`);
+        console.log(`${colors.blue}ℹ${colors.reset} 共有 ${colors.yellow}${selectedProvinces.length}${colors.reset} 个省级行政区待下载\n`);
 
         // 下载全国地图
         const chinaInfo = areaInfos['100000'];
@@ -252,86 +345,85 @@ const main = async () => {
         );
         console.log(`${colors.blue}→${colors.reset} 全国地图下载完成\n`);
 
-        // 处理省级数据
-        for (const [adcode, info] of Object.entries(areaInfos)) {
-            if (adcode.endsWith('0000') && adcode !== '100000') {
-                const provinceCode = adcode;
-                
-                // 获取所有下级行政区
-                const cities = Object.entries(areaInfos).filter(([code]) => 
-                    code.startsWith(provinceCode.slice(0, 2)) && 
-                    code.endsWith('00') && 
-                    code !== provinceCode
-                );
+        // 处理选中的省级数据
+        for (const province of selectedProvinces) {
+            const provinceCode = province.code;
+            const info = areaInfos[provinceCode];
+            
+            // 获取所有下级行政区
+            const cities = Object.entries(areaInfos).filter(([code]) => 
+                code.startsWith(provinceCode.slice(0, 2)) && 
+                code.endsWith('00') && 
+                code !== provinceCode
+            );
 
-                const counties = Object.entries(areaInfos).filter(([code]) => 
-                    code.startsWith(provinceCode.slice(0, 2)) && 
-                    !code.endsWith('00')
-                );
+            const counties = Object.entries(areaInfos).filter(([code]) => 
+                code.startsWith(provinceCode.slice(0, 2)) && 
+                !code.endsWith('00')
+            );
 
-                // 计算该省的总任务数
-                let provinceTotalTasks = 1; // 省级地图
+            // 计算该省的总任务数
+            let provinceTotalTasks = 1; // 省级地图
 
-                // 添加市级地图任务数
-                if (provinceLevel !== 3) {
-                    provinceTotalTasks += cities.length;
+            // 添加市级地图任务数
+            if (provinceLevel !== 3) {
+                provinceTotalTasks += cities.length;
+            }
+
+            // 添加区县级地图任务数（如果需要）
+            if (provinceLevel === 2 || (provinceLevel !== 3 && cityLevel === 1)) {
+                provinceTotalTasks += counties.length;
+            }
+
+            console.log(`${colors.blue}→${colors.reset} 开始处理: ${colors.bright}${info.name}${colors.reset}`);
+            console.log(`${colors.blue}ℹ${colors.reset} 需要下载 ${colors.yellow}${provinceTotalTasks}${colors.reset} 个地图文件`);
+
+            const progressBar = new ProgressBar(info.name, provinceTotalTasks);
+
+            // 下载省级地图（根据选择的粒度决定是否使用 full 版本）
+            await downloadJson(
+                `${baseUrl}${provinceCode}.json`,
+                path.join(finalOutputDir, 'province', getFileName(provinceCode, info, '', nameFormat)),
+                info,
+                progressBar,
+                '省级地图',
+                provinceLevel !== 3  // 如果不是跳过下级边界，则尝试下载 full 版本
+            );
+
+            // 如果不是跳过下级边界
+            if (provinceLevel !== 3) {
+                // 下载市级地图
+                for (const [cityCode, cityInfo] of cities) {
+                    await downloadJson(
+                        `${baseUrl}${cityCode}.json`,
+                        path.join(finalOutputDir, 'citys', getFileName(cityCode, cityInfo, '', nameFormat)),
+                        cityInfo,
+                        progressBar,
+                        `市级: ${cityInfo.name}`,
+                        cityLevel === 1  // 如果选择包含区县级边界，则尝试下载 full 版本
+                    );
                 }
 
-                // 添加区县级地图任务数（如果需要）
-                if (provinceLevel === 2 || (provinceLevel !== 3 && cityLevel === 1)) {
-                    provinceTotalTasks += counties.length;
-                }
-
-                console.log(`${colors.blue}→${colors.reset} 开始处理: ${colors.bright}${info.name}${colors.reset}`);
-                console.log(`${colors.blue}ℹ${colors.reset} 需要下载 ${colors.yellow}${provinceTotalTasks}${colors.reset} 个地图文件`);
-
-                const progressBar = new ProgressBar(info.name, provinceTotalTasks);
-
-                // 下载省级地图（根据选择的粒度决定是否使用 full 版本）
-                await downloadJson(
-                    `${baseUrl}${provinceCode}.json`,
-                    path.join(finalOutputDir, 'province', getFileName(provinceCode, info, '', nameFormat)),
-                    info,
-                    progressBar,
-                    '省级地图',
-                    provinceLevel !== 3  // 如果不是跳过下级边界，则尝试下载 full 版本
-                );
-
-                // 如果不是跳过下级边界
-                if (provinceLevel !== 3) {
-                    // 下载市级地图
-                    for (const [cityCode, cityInfo] of cities) {
+                // 下载区县级地图（如果需要）
+                if (provinceLevel === 2 || cityLevel === 1) {
+                    for (const [countyCode, countyInfo] of counties) {
+                        // 确定目标目录
+                        const isMunicipality = MUNICIPALITIES.includes(provinceCode);
+                        const targetDir = (isMunicipality && municipalityChildrenInCitys) ? 'citys' : 'county';
+                        
                         await downloadJson(
-                            `${baseUrl}${cityCode}.json`,
-                            path.join(finalOutputDir, 'citys', getFileName(cityCode, cityInfo, '', nameFormat)),
-                            cityInfo,
+                            `${baseUrl}${countyCode}.json`,
+                            path.join(finalOutputDir, targetDir, getFileName(countyCode, countyInfo, '', nameFormat)),
+                            countyInfo,
                             progressBar,
-                            `市级: ${cityInfo.name}`,
-                            cityLevel === 1  // 如果选择包含区县级边界，则尝试下载 full 版本
+                            `区县: ${countyInfo.name}`
                         );
                     }
-
-                    // 下载区县级地图（如果需要）
-                    if (provinceLevel === 2 || cityLevel === 1) {
-                        for (const [countyCode, countyInfo] of counties) {
-                            // 确定目标目录
-                            const isMunicipality = MUNICIPALITIES.includes(provinceCode);
-                            const targetDir = (isMunicipality && municipalityChildrenInCitys) ? 'citys' : 'county';
-                            
-                            await downloadJson(
-                                `${baseUrl}${countyCode}.json`,
-                                path.join(finalOutputDir, targetDir, getFileName(countyCode, countyInfo, '', nameFormat)),
-                                countyInfo,
-                                progressBar,
-                                `区县: ${countyInfo.name}`
-                            );
-                        }
-                    }
                 }
-
-                progressBar.complete();
-                console.log(`${colors.green}✓${colors.reset} ${colors.bright}${info.name}${colors.reset} 处理完成！\n`);
             }
+
+            progressBar.complete();
+            console.log(`${colors.green}✓${colors.reset} ${colors.bright}${info.name}${colors.reset} 处理完成！\n`);
         }
 
         console.log(`${colors.green}✨${colors.reset} ${colors.bright}所有地图数据下载完成！${colors.reset}\n`);
